@@ -1,0 +1,5 @@
+# Arbitrary value, change it according to your use-case
+batch_processing_size: 100
+
+# Model blob prefix should begin with the repo name
+model_blob_prefix: 'mlops-template/model.bin'

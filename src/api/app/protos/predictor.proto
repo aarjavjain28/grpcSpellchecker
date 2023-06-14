@@ -1,0 +1,37 @@
+syntax = "proto3";
+package mlops.template;
+
+service LargeModelPredictor {
+  rpc get_predictions(Request) returns (Response) {}
+}
+
+message Request {
+  string input = 1;
+}
+
+message SuggestionList {
+  repeated string suggestion = 1;
+}
+
+message Prediction {
+  string total_words = 1;
+  string well_spelt_words = 2;
+  string ratio = 3;
+  map<string, SuggestionList> suggestions = 4;
+  bool supported_language = 5;
+}
+
+message Metadata {
+  string modelVersion = 1;
+  string modelHash = 2;
+  string modelName = 3;
+  string serviceCreationTimestamp = 4;
+
+}
+
+message Response {
+  string status = 1;
+  string message = 2;
+  repeated Metadata metadata = 3;
+  Prediction data = 4;
+}

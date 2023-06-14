@@ -1,0 +1,6 @@
+model_metadata_config:
+  version: 1.0.0
+  name: mlops-cloud-run-model
+model_download_config:
+  blob_prefix: cloud-run-template
+  destination_path: .

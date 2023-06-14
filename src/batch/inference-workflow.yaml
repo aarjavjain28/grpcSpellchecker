@@ -1,0 +1,297 @@
+main:
+  params: [event]
+  steps:
+    # Do not change this step name
+    # Callable workflows have the format {hyphenated-name}_{hyphenated-semantic-version}
+    # See https://github.com/THG-DataAndAI/mlops-cloud-workflows/
+    - defineCalledWorkflowIds:
+        assign:
+          - getTaskErrors: mlops-get-batch-tasks-errors_0-0-1
+          - parseEventData: mlops-parse-event-data_0-0-1
+          - handleFailure: mlops-handle-inference-workflow-failure_0-0-1
+          - publishMessage: mlops-publish-message_0-0-1
+          - checkForMalformedFile: mlops-check-malformed-file-error_0-0-1
+    - defineGlobals:
+        assign:
+          - batchJobStates:
+              success: "SUCCEEDED"
+              failure: "FAILED"
+
+          - maximumRetryOnTotalFailure: 2
+          - projectId: ${ sys.get_env("GOOGLE_CLOUD_PROJECT_ID") }
+          - thisWorkflowId: ${ sys.get_env("GOOGLE_CLOUD_WORKFLOW_ID") }
+          - thisWorkflowLocation: ${ sys.get_env("GOOGLE_CLOUD_LOCATION") }
+
+          # Batch Container Image Variables
+          - imageRegion: "europe"
+          - imageBase: ${ imageRegion + "-docker.pkg.dev/" + projectId + "/docker/" }
+          # A limitation is that this imageName cannot be passed in from the CI, so we have to hardcode it here as
+          # well as in the CI
+          - imageName: ${ thisWorkflowId }
+          - imageTag: "latest"
+          - imageUri: ${ imageBase + imageName + ":" + imageTag }
+
+          - batchApi: "batch.googleapis.com/v1"
+          - batchRegion: "europe-west2"
+          # The batch region doesn't really matter but we set it anyways
+          - batchApiUrl: ${ "https://" + batchApi + "/projects/" + projectId + "/locations/" + batchRegion + "/jobs" }
+    - parseEvent:
+        # Should we wrap this in a try: except:?
+        call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+        args:
+          workflow_id: ${ parseEventData }
+          argument:
+            eventData: ${ event.data }
+        result: parsedEventData
+    - setVariablesFromParsedEventData:
+        assign:
+          - bucket: ${ parsedEventData.bucket }
+          - inputBlob: ${ parsedEventData.inputBlob }
+          - outputBlob: ${ parsedEventData.outputBlob }
+          - product: ${ parsedEventData.product }
+          - client: ${ parsedEventData.client }
+          - jobId: ${ parsedEventData.jobId }
+          - outputTopic: ${ parsedEventData.outputTopic }
+          - validationChecksPassed: ${ parsedEventData.validationChecksPassed }
+    - raiseErrorIfValidationFailed:
+        switch:
+          - condition: ${ validationChecksPassed == false }
+            steps:
+              - handleValidationFailure:
+                  call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                  args:
+                    workflow_id: ${ handleFailure }
+                    argument:
+                      retry: false
+                      mlOpsCode: 400
+                      mlOpsMessage: ${ "Validation checks failed for object " + inputBlob }
+                      userTopic: ${ outputTopic }
+                      userCode: 400
+                      userMessage: ${ "Validation checks failed for input file " + inputBlob +
+                                      ". Input filenames must only contain dots, dashes, digits or lowercase letters,
+                                      and must not be located in a subdirectory of /inputs." }
+                      bucket: ${ bucket }
+                      inputBlob: ${ inputBlob }
+                      maximumRetryOnTotalFailure: ${ maximumRetryOnTotalFailure }
+                      workflowId: ${ thisWorkflowId }
+                      workflowLocation: ${ thisWorkflowLocation }
+                      eventData: ${ event }
+                  result: failureResult
+              - validationError:
+                  raise: ${ failureResult }
+    - createAndRunBatchJob:
+        steps:
+          - logCreateBatchJob:
+              call: sys.log
+              args:
+                data: ${ "Creating and running the batch job " + jobId + " with input " + inputBlob + " and output " + outputBlob }
+          - getTaskSpec:
+              call: batchJob
+              args:
+                inputBlob: ${ inputBlob }
+                outputBlob: ${ outputBlob }
+                fullImageUri: ${ imageUri }
+              result: myTaskSpec
+          - logTaskSpec:
+              call: sys.log
+              args:
+                data: ${ myTaskSpec }
+          - callBatchAPI:
+              try:
+                call: http.post
+                args:
+                  url: ${ batchApiUrl }
+                  query:
+                    job_id: ${ jobId }
+                  headers:
+                    Content-Type: application/json
+                  auth:
+                    type: OAuth2
+                  body: ${ myTaskSpec }
+                result: createAndRunBatchJobResponse
+              except:
+                as: error
+                steps:
+                  - handleJobCreationFailure:
+                      call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                      args:
+                        workflow_id: ${ handleFailure }
+                        argument:
+                          retry: true
+                          mlOpsCode: ${ error.code }
+                          mlOpsMessage: ${ error.message }
+                          userTopic: ${ outputTopic }
+                          bucket: ${ bucket }
+                          inputBlob: ${ inputBlob }
+                          maximumRetryOnTotalFailure: ${ maximumRetryOnTotalFailure }
+                          workflowId: ${ thisWorkflowId }
+                          workflowLocation: ${ thisWorkflowLocation }
+                          eventData: ${ event }
+                      result: failureResult
+                  - jobCreationError:
+                      raise: ${ failureResult }
+          - checkCreateAndRunBatchJobResponse:
+              switch:
+                - condition: ${ createAndRunBatchJobResponse.code == 200 }
+                  next: checkJobStatusLoop
+    - checkJobStatusLoop:
+        steps:
+          - getJob:
+              call: http.get
+              args:
+                url: ${ batchApiUrl + "/" + jobId }
+                auth:
+                  type: OAuth2
+              result: getJobResult
+          - logState:
+              call: sys.log
+              args:
+                data: ${ "Current job state " + getJobResult.body.status.state }
+          - checkState:
+              switch:
+                - condition: ${ getJobResult.body.status.state == batchJobStates.success }
+                  steps:
+                    - callSuccessResponse:
+                        call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                        args:
+                          workflow_id: ${ publishMessage }
+                          argument:
+                            status: 200
+                            message: "SUCCESS"
+                            data:
+                              bucket: ${ bucket }
+                              object: ${ outputBlob }
+                            topic: ${ outputTopic }
+                    - returnBucketObject:
+                        return:
+                          message: ${ "Batch job run succeeded, " + jobId + ", " + outputBlob }
+                - condition: ${ getJobResult.body.status.state == batchJobStates.failure }
+                  steps:
+                    - checkForMalformedFile:
+                        steps:
+                          - parseBatchLogsForMalformedFile:
+                              call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                              args:
+                                workflow_id: ${ checkForMalformedFile }
+                                argument:
+                                  jobId: ${ jobId }
+                              result: checkForMalformedFileResult
+                          - checkIfMalformed:
+                              switch:
+                                - condition: ${ checkForMalformedFileResult.isMalformedFile }
+                                  steps:
+                                    - handleMalformedFile:
+                                        call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                                        args:
+                                          workflow_id: ${ handleFailure }
+                                          argument:
+                                            retry: false
+                                            mlOpsCode: 400
+                                            mlOpsMessage: ${ checkForMalformedFileResult.malformedFileError }
+                                            userCode: 400
+                                            userMessage: ${ checkForMalformedFileResult.malformedFileError }
+                                            userTopic: ${ outputTopic }
+                                            bucket: ${ bucket }
+                                            inputBlob: ${ inputBlob }
+                                            maximumRetryOnTotalFailure: ${ maximumRetryOnTotalFailure }
+                                            workflowId: ${ thisWorkflowId }
+                                            workflowLocation: ${ thisWorkflowLocation }
+                                            eventData: ${ event }
+                                        result: failureResult
+                                    - raiseMalformedFileError:
+                                        raise: ${ failureResult }
+                    - getTaskInfo:
+                        call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                        args:
+                          workflow_id: ${ getTaskErrors }
+                          argument:
+                            endpoint: ${ batchApiUrl + "/" + jobId }
+                        result: getTaskInfoResult
+                    - handleJobFailure:
+                        call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                        args:
+                          workflow_id: ${ handleFailure }
+                          argument:
+                            retry: true
+                            mlOpsCode: 500
+                            mlOpsMessage:
+                              message: ${ "Batch job run with UID " + getJobResult.body.uid + " failed." }
+                              jobError: ${ getJobResult.body }
+                              taskErrors: ${ getTaskInfoResult }
+                            userTopic: ${ outputTopic }
+                            bucket: ${ bucket }
+                            inputBlob: ${ inputBlob }
+                            maximumRetryOnTotalFailure: ${ maximumRetryOnTotalFailure }
+                            workflowId: ${ thisWorkflowId }
+                            workflowLocation: ${ thisWorkflowLocation }
+                            eventData: ${ event }
+                        result: failureResult
+                    - jobFailedError:
+                        raise: ${ failureResult }
+              next: sleep
+          - sleep:
+              call: sys.sleep
+              args:
+                seconds: 10
+              next: checkJobStatusLoop
+
+
+# This subworkflow returns the spec of a GPU batch job that will form the body of the request to the Batch API
+# See https://cloud.google.com/batch/docs/reference/rest/v1/projects.locations.jobs#Job
+batchJob:
+  params: [
+      # e.g. my-input.jsonl
+      inputBlob,
+      # e.g. my-input-{timestamp}.jsonl
+      outputBlob,
+      # e.g. "europe-docker.pkg.dev/my-project/docker/my-image"
+      fullImageUri
+  ]
+  steps:
+    - setSpec:
+        assign:
+          - spec:
+              # TASK SPEC BEGINS HERE
+              taskGroups:
+                taskSpec:
+                  runnables:
+                    - container:
+                        imageUri: ${ fullImageUri }
+                        # TODO: REMOVE FOR CPU
+                        options: "--privileged"
+                        volumes:
+                          - "/var/lib/nvidia/lib64:/usr/local/nvidia/lib64"
+                          - "/var/lib/nvidia/bin:/usr/local/nvidia/bin"
+                        # END REMOVE
+                        entrypoint: "python"
+                        commands:
+                          - "main.py"
+                          - ${ inputBlob }
+                          - ${ outputBlob }
+                  maxRetryCount: 1
+                taskCount: 1
+              logsPolicy:
+                destination: CLOUD_LOGGING
+              allocationPolicy:
+                instances:
+                  - installGpuDrivers: true
+                    policy:
+                      machineType: n1-standard-4
+                      # TODO: REMOVE FOR CPU
+                      accelerators:
+                        - type: nvidia-tesla-t4
+                          count: 1
+                      # END REMOVE
+                      bootDisk:
+                        sizeGb: 50
+                        # "batch-cos": use Batch Container-Optimized images. See https://cloud.google.com/batch/docs/reference/rest/v1/projects.locations.jobs#Disk
+                        image: batch-cos
+                location:
+                  allowedLocations:
+                    - zones/europe-west1-b
+                    - zones/europe-west1-d
+                serviceAccount:
+                  email: ${ "mlops-template@" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + ".iam.gserviceaccount.com" }
+              # TASK SPEC ENDS HERE
+    - returnSpec:
+        return: ${ spec }
